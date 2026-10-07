@@ -1,4 +1,5 @@
 import { assertCondition, assertFound } from '../domain/errors.js';
+import { toUtcIso } from '../domain/time.js';
 export class CustodyService {
     store;
     constructor(store) {
@@ -13,6 +14,7 @@ export class CustodyService {
         assertCondition(container.currentHolderId === input.fromHolderId, 'custody.holder_mismatch', 'container is held by a different user');
         assertCondition(container.custodyStatus === 'SEALED' || container.custodyStatus === 'RECEIVED' || container.custodyStatus === 'RELEASED_TO_LAB', 'custody.invalid_state', 'container cannot be handed over in its current state');
         const prior = [...this.store.transfers.values()].filter((item) => item.containerId === input.containerId).sort((a, b) => b.transferSequence - a.transferSequence)[0];
+        const handedOverAt = toUtcIso(input.handedOverAt, 'handedOverAt');
         const transfer = {
             id: this.store.nextId('transfer'),
             tenantId: input.tenantId,
@@ -23,7 +25,7 @@ export class CustodyService {
             toHolderId: input.toHolderId,
             fromLocation: input.fromLocation,
             toLocation: input.toLocation,
-            handedOverAt: input.handedOverAt,
+            handedOverAt,
             temperatureCelsius: input.temperatureCelsius,
             sealStatus: input.sealStatus,
             status: input.sealStatus === 'INTACT' ? 'PENDING_RECEIPT' : 'ISOLATED',
@@ -35,7 +37,7 @@ export class CustodyService {
         container.currentLocation = input.toLocation;
         container.custodyStatus = transfer.status === 'ISOLATED' ? 'ISOLATED' : 'HANDED_OVER';
         container.sealStatus = input.sealStatus;
-        container.temperatureLog.push({ recordedAt: input.handedOverAt, celsius: input.temperatureCelsius, source: 'HANDHELD' });
+        insertByInstant(container.temperatureLog, { recordedAt: handedOverAt, celsius: input.temperatureCelsius, source: 'HANDHELD' });
         container.version += 1;
         this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'custody.handed_over', entity: 'container', entityId: container.id, metadata: { transferId: transfer.id, sequence: transfer.transferSequence, sealStatus: input.sealStatus } });
         this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'custody.handed-over', aggregateId: container.id, payload: JSON.stringify({ transferId: transfer.id, transferSequence: transfer.transferSequence, containerId: container.id }) });
@@ -48,13 +50,14 @@ export class CustodyService {
             return transfer;
         assertCondition(transfer.status === 'PENDING_RECEIPT', 'custody.not_pending', 'transfer is not pending receipt');
         assertCondition(transfer.toHolderId === input.receiverId, 'custody.receiver_mismatch', 'receiver does not match the transfer');
-        transfer.receivedAt = input.receivedAt;
+        const receivedAt = toUtcIso(input.receivedAt, 'receivedAt');
+        transfer.receivedAt = receivedAt;
         transfer.sealStatus = input.sealStatus;
         transfer.status = input.sealStatus === 'INTACT' ? 'CONFIRMED' : 'ISOLATED';
         transfer.version += 1;
         container.custodyStatus = transfer.status === 'CONFIRMED' ? 'RECEIVED' : 'ISOLATED';
         container.sealStatus = input.sealStatus;
-        container.temperatureLog.push({ recordedAt: input.receivedAt, celsius: input.temperatureCelsius, source: 'LAB_RECEIPT' });
+        insertByInstant(container.temperatureLog, { recordedAt: receivedAt, celsius: input.temperatureCelsius, source: 'LAB_RECEIPT' });
         container.version += 1;
         this.store.addAudit({ tenantId: transfer.tenantId, projectId: transfer.projectId, action: 'custody.received', entity: 'transfer', entityId: transfer.id, metadata: { sequence: transfer.transferSequence, sealStatus: input.sealStatus } });
         this.store.addOutbox({ tenantId: transfer.tenantId, projectId: transfer.projectId, topic: 'custody.received', aggregateId: container.id, payload: JSON.stringify({ transferId, containerId: container.id, status: transfer.status }) });
@@ -63,4 +66,16 @@ export class CustodyService {
     assertScope(actualTenant, actualProject, tenantId, projectId) {
         assertCondition(actualTenant === tenantId && actualProject === projectId, 'scope.forbidden', 'object does not belong to the requested project');
     }
+}
+/**
+ * Inserts a reading so the trail stays ordered by event instant, not by
+ * arrival order. Offline devices upload late, so a backdated reading must
+ * land before later ones that were appended earlier. Ties keep arrival order.
+ */
+function insertByInstant(log, reading) {
+    const instant = Date.parse(reading.recordedAt);
+    let index = log.length;
+    while (index > 0 && Date.parse(log[index - 1].recordedAt) > instant)
+        index -= 1;
+    log.splice(index, 0, reading);
 }

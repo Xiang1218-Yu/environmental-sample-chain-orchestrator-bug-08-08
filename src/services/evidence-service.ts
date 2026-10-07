@@ -30,6 +30,7 @@ export class EvidenceService {
       requestKey: input.requestKey,
       status: 'GENERATING',
       snapshotVersion,
+      generatedAt: this.store.now(),
       sourceIds,
       fileKeys: [],
       version: 1,
@@ -40,7 +41,6 @@ export class EvidenceService {
     packageRecord.manifestHash = manifestHash;
     packageRecord.fileKeys = [fileKey];
     packageRecord.version += 1;
-    packageRecord.frozenAt = this.store.now();
     this.store.evidence.set(packageRecord.id, packageRecord);
     this.store.files.set(fileKey, { key: fileKey, contentHash: manifestHash, createdAt: this.store.now(), status: 'COMMITTED' });
     this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'evidence.generated', entity: 'evidence', entityId: packageRecord.id, metadata: { snapshotVersion, sourceCount: results.length } });
@@ -53,6 +53,7 @@ export class EvidenceService {
     if (packageRecord.status === 'FROZEN') return packageRecord;
     if (packageRecord.status !== 'READY') throw new DomainError('evidence.not_ready', 'only ready evidence packages can be frozen');
     packageRecord.status = 'FROZEN';
+    packageRecord.frozenAt = this.store.now();
     packageRecord.version += 1;
     this.store.addAudit({ tenantId: packageRecord.tenantId, projectId: packageRecord.projectId, action: 'evidence.frozen', entity: 'evidence', entityId: packageRecord.id, metadata: { manifestHash: packageRecord.manifestHash ?? null } });
     return packageRecord;

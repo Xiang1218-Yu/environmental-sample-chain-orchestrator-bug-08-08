@@ -1,5 +1,6 @@
 import type { SyncApplyResult, SyncEnvelope } from '../domain/types.js';
 import { assertCondition, DomainError } from '../domain/errors.js';
+import { parseInstant } from '../domain/time.js';
 import { Store } from '../store/store.js';
 import { SamplingService } from './sampling-service.js';
 import { CustodyService } from './custody-service.js';
@@ -11,6 +12,9 @@ export class SyncService {
 
   async apply(envelope: SyncEnvelope): Promise<SyncApplyResult> {
     return this.store.transaction(() => {
+      // The envelope's event time must be unambiguous before anything is applied;
+      // `appliedAt` on the sync record stays the server-side receive instant.
+      parseInstant(envelope.occurredAt, 'occurredAt');
       const key = `${envelope.tenantId}|${envelope.projectId}|${envelope.deviceId}|${envelope.operationId}`;
       const existing = this.store.syncRecords.get(key);
       if (existing) {

@@ -1,5 +1,6 @@
 import type { InstrumentRun, ResultRevision } from '../domain/types.js';
 import { assertCondition, assertFound } from '../domain/errors.js';
+import { assertWithinClockSkew, toUtcIso } from '../domain/time.js';
 import { Store } from '../store/store.js';
 
 export interface RegisterRunInput {
@@ -26,6 +27,10 @@ export interface ResultInput {
   qualityFlags: string[];
   instrumentSoftwareVersion: string;
   contentHash: string;
+  /** Business revision (结果修订号) assigned by the instrument/LIMS. */
+  revisionNumber: number;
+  /** Event instant (事件发生时间) on the instrument clock, with explicit offset. */
+  occurredAt: string;
 }
 
 export class ResultService {
@@ -40,7 +45,7 @@ export class ResultService {
     const batch = assertFound(this.store.batches.get(input.batchId), 'batch.not_found', 'batch not found');
     assertCondition(batch.tenantId === input.tenantId && batch.projectId === input.projectId, 'scope.forbidden', 'batch is outside the requested project');
     assertCondition(batch.status === 'RUNNING' || batch.status === 'RESULTS_PENDING', 'result.batch_not_running', 'batch is not accepting instrument runs');
-    const run: InstrumentRun = { id: this.store.nextId('run'), tenantId: input.tenantId, projectId: input.projectId, batchId: input.batchId, externalRunId: input.externalRunId, rawFileHash: input.rawFileHash, instrumentSoftwareVersion: input.instrumentSoftwareVersion, startedAt: input.startedAt, status: 'REGISTERED', version: 1 };
+    const run: InstrumentRun = { id: this.store.nextId('run'), tenantId: input.tenantId, projectId: input.projectId, batchId: input.batchId, externalRunId: input.externalRunId, rawFileHash: input.rawFileHash, instrumentSoftwareVersion: input.instrumentSoftwareVersion, startedAt: toUtcIso(input.startedAt, 'startedAt'), status: 'REGISTERED', version: 1 };
     this.store.runs.set(run.id, run);
     batch.status = 'RESULTS_PENDING';
     batch.version += 1;
@@ -52,25 +57,39 @@ export class ResultService {
     const run = assertFound(this.store.runs.get(runId), 'result.run_not_found', 'instrument run not found');
     assertCondition(run.status === 'REGISTERED' || run.status === 'RUNNING', 'result.run_closed', 'instrument run is already closed');
     run.status = status;
-    run.completedAt = completedAt;
+    run.completedAt = toUtcIso(completedAt, 'completedAt');
     run.version += 1;
     return run;
   }
 
+  /**
+   * Ingests one business revision. Ordering is driven by the client-supplied
+   * revision number, never by arrival order or wall-clock time:
+   * - a replay of an already-seen revision (same number, same content) is idempotent;
+   * - the same revision number with different content is a conflict;
+   * - a higher revision supersedes the current one, even if it arrives late;
+   * - a lower revision is kept for the audit trail but never becomes current.
+   */
   ingestRevision(input: ResultInput): ResultRevision {
     const run = assertFound(this.store.runs.get(input.runId), 'result.run_not_found', 'instrument run not found');
     const batch = assertFound(this.store.batches.get(input.batchId), 'batch.not_found', 'batch not found');
     assertCondition(run.batchId === batch.id && run.projectId === input.projectId && batch.projectId === input.projectId, 'scope.forbidden', 'result does not belong to the requested batch');
-    const current = this.findCurrent(input);
-    if (current) {
-      if (current.contentHash === input.contentHash) return current;
-      const next = this.findNextRevision(input, current);
-      return this.createRevision(input, next, current.id);
+    assertCondition(Number.isInteger(input.revisionNumber) && input.revisionNumber >= 1, 'result.invalid_revision', 'revision number must be a positive integer');
+    const occurredAt = toUtcIso(input.occurredAt, 'occurredAt');
+    const receivedAt = this.store.now();
+    assertWithinClockSkew(occurredAt, receivedAt, 'result.clock_skew', 'occurredAt');
+    const revisions = this.findRevisions(input);
+    const sameRevision = revisions.find((result) => result.revisionNumber === input.revisionNumber);
+    if (sameRevision) {
+      assertCondition(sameRevision.contentHash === input.contentHash, 'result.revision_conflict', 'revision number already exists with different content');
+      return sameRevision;
     }
-    return this.createRevision(input, 1);
+    const current = revisions.filter((result) => result.status === 'CURRENT').sort((a, b) => b.revisionNumber - a.revisionNumber)[0];
+    const supersedes = current && input.revisionNumber > current.revisionNumber ? current : undefined;
+    return this.createRevision(input, occurredAt, receivedAt, supersedes, current !== undefined && supersedes === undefined);
   }
 
-  private createRevision(input: ResultInput, revisionNumber: number, supersedesRevisionId?: string): ResultRevision {
+  private createRevision(input: ResultInput, occurredAt: string, receivedAt: string, supersedes: ResultRevision | undefined, supersededOnArrival: boolean): ResultRevision {
     const result: ResultRevision = {
       id: this.store.nextId('result'),
       tenantId: input.tenantId,
@@ -86,28 +105,24 @@ export class ResultService {
       qualityFlags: [...input.qualityFlags],
       instrumentSoftwareVersion: input.instrumentSoftwareVersion,
       contentHash: input.contentHash,
-      revisionNumber,
-      ...(supersedesRevisionId === undefined ? {} : { supersedesRevisionId }),
-      status: 'CURRENT',
-      createdAt: this.store.now(),
+      revisionNumber: input.revisionNumber,
+      ...(supersedes === undefined ? {} : { supersedesRevisionId: supersedes.id }),
+      status: supersededOnArrival ? 'SUPERSEDED' : 'CURRENT',
+      occurredAt,
+      receivedAt,
       version: 1,
     };
-    if (supersedesRevisionId) {
-      const prior = assertFound(this.store.results.get(supersedesRevisionId), 'result.previous_missing', 'previous result revision not found');
-      prior.status = 'SUPERSEDED';
-      prior.version += 1;
+    if (supersedes) {
+      supersedes.status = 'SUPERSEDED';
+      supersedes.version += 1;
     }
     this.store.results.set(result.id, result);
-    this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'result.revision_created', entity: 'result', entityId: result.id, metadata: { batchId: input.batchId, revisionNumber, analyte: input.analyte } });
-    this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'result.revision-created', aggregateId: result.id, payload: JSON.stringify({ resultId: result.id, batchId: input.batchId, revisionNumber }) });
+    this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'result.revision_created', entity: 'result', entityId: result.id, metadata: { batchId: input.batchId, revisionNumber: input.revisionNumber, analyte: input.analyte, status: result.status } });
+    this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'result.revision-created', aggregateId: result.id, payload: JSON.stringify({ resultId: result.id, batchId: input.batchId, revisionNumber: input.revisionNumber }) });
     return result;
   }
 
-  private findCurrent(input: ResultInput): ResultRevision | undefined {
-    return [...this.store.results.values()].filter((result) => result.projectId === input.projectId && result.batchId === input.batchId && result.analyte === input.analyte && result.aliquotId === input.aliquotId && result.controlKind === input.controlKind && result.status === 'CURRENT').sort((a, b) => b.revisionNumber - a.revisionNumber)[0];
-  }
-
-  private findNextRevision(input: ResultInput, current: ResultRevision): number {
-    return Math.max(current.revisionNumber + 1, ...[...this.store.results.values()].filter((result) => result.batchId === input.batchId && result.analyte === input.analyte && result.aliquotId === input.aliquotId && result.controlKind === input.controlKind).map((result) => result.revisionNumber + 1));
+  private findRevisions(input: ResultInput): ResultRevision[] {
+    return [...this.store.results.values()].filter((result) => result.projectId === input.projectId && result.batchId === input.batchId && result.analyte === input.analyte && result.aliquotId === input.aliquotId && result.controlKind === input.controlKind);
   }
 }

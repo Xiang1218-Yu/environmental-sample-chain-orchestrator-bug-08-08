@@ -29,7 +29,13 @@ export interface SamplingRecord extends Versioned {
   collectorId: UserId;
   protocolVersion: string;
   medium: 'WATER' | 'SOIL' | 'AIR' | 'SEDIMENT';
+  /** Event instant (事件发生时间): collection time, canonical UTC. */
   collectedAt: string;
+  /** Local business date (本地业务日期): YYYY-MM-DD in the collector's own offset. */
+  collectedDateLocal: string;
+  /** Receive instant (接收时间): when the server first ingested this record. */
+  ingestedAt: string;
+  /** Event instant of laboratory receipt, canonical UTC. */
   receivedAt?: string;
   location: { latitude: number; longitude: number; siteCode: string };
   preservation: { temperatureCelsius: number; method: string; maxTransitHours: number };
@@ -86,7 +92,12 @@ export interface ReceivingRecord extends Versioned {
   containerId: ContainerId;
   decision: ReceivingDecision;
   receivedBy: UserId;
+  /** Event instant (事件发生时间): lab receive time, canonical UTC. */
   receivedAt: string;
+  /** Local business date (本地业务日期): YYYY-MM-DD in the lab's reported offset. */
+  receivedDateLocal: string;
+  /** Receive instant (接收时间): when the server ingested this record. */
+  recordedAt: string;
   temperatureCelsius: number;
   sealStatus: SealStatus;
   reason?: string;
@@ -158,10 +169,14 @@ export interface ResultRevision extends Versioned {
   qualityFlags: string[];
   instrumentSoftwareVersion: string;
   contentHash: string;
+  /** Business revision (结果修订号) assigned by the instrument/LIMS; ordering key, independent of arrival order. */
   revisionNumber: number;
   supersedesRevisionId?: ResultId;
   status: 'CURRENT' | 'SUPERSEDED' | 'WITHDRAWN';
-  createdAt: string;
+  /** Event instant (事件发生时间): when the instrument produced this result, canonical UTC. */
+  occurredAt: string;
+  /** Receive instant (接收时间): when the server ingested this revision. */
+  receivedAt: string;
 }
 
 export interface QualityDecision extends Versioned {
@@ -184,6 +199,9 @@ export interface EvidencePackage extends Versioned {
   requestKey: string;
   status: EvidenceStatus;
   snapshotVersion: number;
+  /** Receive instant (接收时间): when the package was first generated, canonical UTC. */
+  generatedAt: string;
+  /** Receive instant (接收时间): when the package was frozen; unset until then. */
   frozenAt?: string;
   sourceIds: { sampleIds: SampleId[]; containerIds: ContainerId[]; batchIds: BatchId[]; resultIds: ResultId[]; qualityDecisionIds: string[] };
   manifestHash?: string;

@@ -1,4 +1,5 @@
 import { assertCondition, DomainError } from '../domain/errors.js';
+import { parseInstant } from '../domain/time.js';
 export class SyncService {
     store;
     sampling;
@@ -14,6 +15,9 @@ export class SyncService {
     }
     async apply(envelope) {
         return this.store.transaction(() => {
+            // The envelope's event time must be unambiguous before anything is applied;
+            // `appliedAt` on the sync record stays the server-side receive instant.
+            parseInstant(envelope.occurredAt, 'occurredAt');
             const key = `${envelope.tenantId}|${envelope.projectId}|${envelope.deviceId}|${envelope.operationId}`;
             const existing = this.store.syncRecords.get(key);
             if (existing) {

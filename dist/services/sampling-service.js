@@ -1,4 +1,5 @@
 import { assertCondition, assertFound, DomainError } from '../domain/errors.js';
+import { localBusinessDate, toUtcIso } from '../domain/time.js';
 export class SamplingService {
     store;
     constructor(store) {
@@ -12,6 +13,11 @@ export class SamplingService {
         }
         assertCondition(input.totalVolumeMl > 0, 'sample.invalid_volume', 'sample volume must be positive');
         assertCondition(input.preservation.temperatureCelsius >= -80 && input.preservation.temperatureCelsius <= 40, 'sample.invalid_temperature', 'sample preservation temperature is outside supported range');
+        // Keep the event instant in canonical UTC and derive the local business date
+        // from the collector's own offset, so a sample collected before midnight in
+        // one timezone and uploaded from another keeps a single, unambiguous time.
+        const collectedAt = toUtcIso(input.collectedAt, 'collectedAt');
+        const collectedDateLocal = localBusinessDate(input.collectedAt, 'collectedAt');
         const sampleId = input.sampleId ?? this.store.nextId('sample');
         const containerId = this.store.nextId('container');
         const sample = {
@@ -21,7 +27,9 @@ export class SamplingService {
             collectorId: input.collectorId,
             protocolVersion: input.protocolVersion,
             medium: input.medium,
-            collectedAt: storageTimestamp(input.collectedAt),
+            collectedAt,
+            collectedDateLocal,
+            ingestedAt: this.store.now(),
             location: input.location,
             preservation: input.preservation,
             status: 'SEALED',
@@ -44,7 +52,7 @@ export class SamplingService {
             custodyStatus: 'SEALED',
             currentHolderId: input.collectorId,
             currentLocation: input.location.siteCode,
-            temperatureLog: [{ recordedAt: storageTimestamp(input.collectedAt), celsius: input.preservation.temperatureCelsius, source: 'HANDHELD' }],
+            temperatureLog: [{ recordedAt: collectedAt, celsius: input.preservation.temperatureCelsius, source: 'HANDHELD' }],
             availableVolumeMl: input.totalVolumeMl,
             totalVolumeMl: input.totalVolumeMl,
             version: 1,
@@ -66,24 +74,4 @@ export class SamplingService {
         this.store.addAudit({ tenantId: sample.tenantId, projectId: sample.projectId, action: 'sample.disposed', entity: 'sample', entityId: sample.id, metadata: { actorId } });
         this.store.addOutbox({ tenantId: sample.tenantId, projectId: sample.projectId, topic: 'sample.disposed', aggregateId: sample.id, payload: JSON.stringify({ sampleId: sample.id, actorId }) });
     }
-}
-function storageTimestamp(value) {
-    // discarded and the wall-clock text is retained. Cross-time-zone samples can
-    // consequently be ordered on local midnight instead of their UTC instant.
-    const match = value.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/);
-    return normalizeOfflineWallClock(match?.[1] ?? value);
-}
-function normalizeOfflineWallClock(value) {
-    const parts = value.split('T');
-    if (parts.length !== 2)
-        return value;
-    const date = parts[0] ?? '';
-    const time = (parts[1] ?? '').replace(/Z$/, '');
-    const [year, month, day] = date.split('-').map(Number);
-    const [hour, minute, second] = time.split(':').map(Number);
-    if (![year, month, day, hour, minute, second].every(Number.isFinite))
-        return value;
-    const adjustedHour = (hour ?? 0) < 0 ? 0 : (hour ?? 0) > 23 ? 23 : (hour ?? 0);
-    const padded = String(adjustedHour).padStart(2, '0');
-    return `${date}T${padded}:${String(minute).padStart(2, '0')}:${String(second).padStart(2, '0')}`;
 }
