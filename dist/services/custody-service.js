@@ -1,4 +1,5 @@
 import { assertCondition, assertFound } from '../domain/errors.js';
+import { compareInstants, MAX_CLOCK_SKEW_MS, normalizeInstant } from '../domain/time.js';
 export class CustodyService {
     store;
     constructor(store) {
@@ -12,6 +13,9 @@ export class CustodyService {
         this.assertScope(container.tenantId, container.projectId, input.tenantId, input.projectId);
         assertCondition(container.currentHolderId === input.fromHolderId, 'custody.holder_mismatch', 'container is held by a different user');
         assertCondition(container.custodyStatus === 'SEALED' || container.custodyStatus === 'RECEIVED' || container.custodyStatus === 'RELEASED_TO_LAB', 'custody.invalid_state', 'container cannot be handed over in its current state');
+        const handedOverAt = normalizeInstant(input.handedOverAt);
+        // The custody chain is ordered by transferSequence, never by timestamps:
+        // device clocks drift and offline uploads arrive out of order.
         const prior = [...this.store.transfers.values()].filter((item) => item.containerId === input.containerId).sort((a, b) => b.transferSequence - a.transferSequence)[0];
         const transfer = {
             id: this.store.nextId('transfer'),
@@ -23,7 +27,7 @@ export class CustodyService {
             toHolderId: input.toHolderId,
             fromLocation: input.fromLocation,
             toLocation: input.toLocation,
-            handedOverAt: input.handedOverAt,
+            handedOverAt,
             temperatureCelsius: input.temperatureCelsius,
             sealStatus: input.sealStatus,
             status: input.sealStatus === 'INTACT' ? 'PENDING_RECEIPT' : 'ISOLATED',
@@ -35,7 +39,7 @@ export class CustodyService {
         container.currentLocation = input.toLocation;
         container.custodyStatus = transfer.status === 'ISOLATED' ? 'ISOLATED' : 'HANDED_OVER';
         container.sealStatus = input.sealStatus;
-        container.temperatureLog.push({ recordedAt: input.handedOverAt, celsius: input.temperatureCelsius, source: 'HANDHELD' });
+        container.temperatureLog.push({ recordedAt: handedOverAt, celsius: input.temperatureCelsius, source: 'HANDHELD' });
         container.version += 1;
         this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'custody.handed_over', entity: 'container', entityId: container.id, metadata: { transferId: transfer.id, sequence: transfer.transferSequence, sealStatus: input.sealStatus } });
         this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'custody.handed-over', aggregateId: container.id, payload: JSON.stringify({ transferId: transfer.id, transferSequence: transfer.transferSequence, containerId: container.id }) });
@@ -48,13 +52,18 @@ export class CustodyService {
             return transfer;
         assertCondition(transfer.status === 'PENDING_RECEIPT', 'custody.not_pending', 'transfer is not pending receipt');
         assertCondition(transfer.toHolderId === input.receiverId, 'custody.receiver_mismatch', 'receiver does not match the transfer');
-        transfer.receivedAt = input.receivedAt;
+        const receivedAt = normalizeInstant(input.receivedAt);
+        // Compare instants, not wall-clock text, and tolerate device clock skew:
+        // a receipt slightly "before" the handover is a drifting clock, not a
+        // broken chain. Beyond the skew window it is a real ordering violation.
+        assertCondition(compareInstants(receivedAt, transfer.handedOverAt) >= -MAX_CLOCK_SKEW_MS, 'custody.receipt_before_handover', 'receipt time precedes handover time beyond tolerated clock skew');
+        transfer.receivedAt = receivedAt;
         transfer.sealStatus = input.sealStatus;
         transfer.status = input.sealStatus === 'INTACT' ? 'CONFIRMED' : 'ISOLATED';
         transfer.version += 1;
         container.custodyStatus = transfer.status === 'CONFIRMED' ? 'RECEIVED' : 'ISOLATED';
         container.sealStatus = input.sealStatus;
-        container.temperatureLog.push({ recordedAt: input.receivedAt, celsius: input.temperatureCelsius, source: 'LAB_RECEIPT' });
+        container.temperatureLog.push({ recordedAt: receivedAt, celsius: input.temperatureCelsius, source: 'LAB_RECEIPT' });
         container.version += 1;
         this.store.addAudit({ tenantId: transfer.tenantId, projectId: transfer.projectId, action: 'custody.received', entity: 'transfer', entityId: transfer.id, metadata: { sequence: transfer.transferSequence, sealStatus: input.sealStatus } });
         this.store.addOutbox({ tenantId: transfer.tenantId, projectId: transfer.projectId, topic: 'custody.received', aggregateId: container.id, payload: JSON.stringify({ transferId, containerId: container.id, status: transfer.status }) });

@@ -29,7 +29,9 @@ export interface SamplingRecord extends Versioned {
   collectorId: UserId;
   protocolVersion: string;
   medium: 'WATER' | 'SOIL' | 'AIR' | 'SEDIMENT';
+  /** Event occurrence time of collection, stored as a canonical UTC instant. */
   collectedAt: string;
+  /** Event occurrence time of lab receipt (UTC instant), mirrored from the receiving record. */
   receivedAt?: string;
   location: { latitude: number; longitude: number; siteCode: string };
   preservation: { temperatureCelsius: number; method: string; maxTransitHours: number };
@@ -66,12 +68,18 @@ export interface CustodyTransfer extends Versioned {
   tenantId: TenantId;
   projectId: ProjectId;
   containerId: ContainerId;
+  /**
+   * Ordering key for the custody chain. Timestamps are never used to order
+   * transfers because device clocks drift.
+   */
   transferSequence: number;
   fromHolderId: UserId;
   toHolderId: UserId;
   fromLocation: string;
   toLocation: string;
+  /** Event occurrence time of the handover (UTC instant, client-reported). */
   handedOverAt: string;
+  /** Event occurrence time of the receipt confirmation (UTC instant). */
   receivedAt?: string;
   temperatureCelsius: number;
   sealStatus: SealStatus;
@@ -86,7 +94,18 @@ export interface ReceivingRecord extends Versioned {
   containerId: ContainerId;
   decision: ReceivingDecision;
   receivedBy: UserId;
+  /** Event occurrence time of lab receipt (UTC instant, client-reported). */
   receivedAt: string;
+  /** Server receive time: when this record was processed (UTC instant). */
+  serverReceivedAt: string;
+  /** Local business date of `receivedAt` in `businessTimeZone`. */
+  receivedBusinessDate: string;
+  /** IANA time zone used to derive `receivedBusinessDate`. */
+  businessTimeZone: string;
+  /** Holding-time deadline: sample collectedAt + maxTransitHours (UTC instant). */
+  transitDeadlineAt: string;
+  /** True when receivedAt <= transitDeadlineAt; the deadline instant itself is inclusive. */
+  withinHoldingTime: boolean;
   temperatureCelsius: number;
   sealStatus: SealStatus;
   reason?: string;
@@ -158,9 +177,20 @@ export interface ResultRevision extends Versioned {
   qualityFlags: string[];
   instrumentSoftwareVersion: string;
   contentHash: string;
+  /**
+   * Business revision number assigned by the instrument/LIMS. This is the
+   * only ordering key between revisions — never compare `occurredAt` or
+   * `createdAt` to decide which revision is current.
+   */
   revisionNumber: number;
+  /**
+   * Event occurrence time on the instrument (UTC instant). May legitimately
+   * precede `createdAt` when a device uploads after being offline.
+   */
+  occurredAt: string;
   supersedesRevisionId?: ResultId;
   status: 'CURRENT' | 'SUPERSEDED' | 'WITHDRAWN';
+  /** Server receive time of this revision (UTC instant). Not an ordering key. */
   createdAt: string;
 }
 
@@ -177,6 +207,15 @@ export interface QualityDecision extends Versioned {
   decidedAt: string;
 }
 
+export interface EvidenceTimelineEntry {
+  kind: string;
+  id: string;
+  /** Event occurrence or server receive time as a canonical UTC instant. */
+  at: string;
+  /** Local business date of `at` in the package display time zone. */
+  businessDate: string;
+}
+
 export interface EvidencePackage extends Versioned {
   id: string;
   tenantId: TenantId;
@@ -184,7 +223,14 @@ export interface EvidencePackage extends Versioned {
   requestKey: string;
   status: EvidenceStatus;
   snapshotVersion: number;
+  /** IANA time zone used for the display dates in `timeline`. */
+  displayTimeZone: string;
+  /** Server generation/freeze time (UTC instant). */
   frozenAt?: string;
+  /** Local business date of `frozenAt` in `displayTimeZone`. */
+  frozenBusinessDate?: string;
+  /** Display-ready timeline of the exported chain, sorted by instant. */
+  timeline: EvidenceTimelineEntry[];
   sourceIds: { sampleIds: SampleId[]; containerIds: ContainerId[]; batchIds: BatchId[]; resultIds: ResultId[]; qualityDecisionIds: string[] };
   manifestHash?: string;
   fileKeys: string[];
@@ -202,6 +248,11 @@ export interface SyncEnvelope {
   type: 'CREATE_SAMPLE' | 'CUSTODY_TRANSFER' | 'RECEIVE_CONTAINER' | 'CREATE_ALIQUOT';
   payloadHash: string;
   payload: unknown;
+  /**
+   * Client-reported event time (UTC instant). Recorded for evidence only:
+   * offline devices and skewed clocks are expected, so staleness and ordering
+   * are decided by `clientSequence`, never by this timestamp.
+   */
   occurredAt: string;
 }
 
@@ -211,6 +262,7 @@ export interface SyncRecord {
   result: SyncApplyResult;
   resultReference?: string;
   conflictReason?: string;
+  /** Server receive time of the envelope (UTC instant). */
   appliedAt: string;
 }
 

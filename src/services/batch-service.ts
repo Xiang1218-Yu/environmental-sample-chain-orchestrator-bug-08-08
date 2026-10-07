@@ -1,5 +1,6 @@
 import type { AnalysisBatch, ControlRequirement } from '../domain/types.js';
 import { assertCondition, assertFound } from '../domain/errors.js';
+import { normalizeInstant } from '../domain/time.js';
 import { Store } from '../store/store.js';
 import { AliquotService } from './aliquot-service.js';
 
@@ -61,9 +62,10 @@ export class BatchService {
   start(batchId: string, startedAt: string): AnalysisBatch {
     const batch = assertFound(this.store.batches.get(batchId), 'batch.not_found', 'batch not found');
     assertCondition(batch.status === 'READY', 'batch.invalid_start', 'only ready batches can start');
+    const startedAtInstant = normalizeInstant(startedAt);
     batch.status = 'RUNNING';
-    batch.startedAt = startedAt;
-    batch.frozenAt = startedAt;
+    batch.startedAt = startedAtInstant;
+    batch.frozenAt = startedAtInstant;
     batch.version += 1;
     for (const aliquotId of batch.memberAliquotIds) {
       const aliquot = assertFound(this.store.aliquots.get(aliquotId), 'aliquot.not_found', 'batch member aliquot not found');

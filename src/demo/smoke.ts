@@ -43,7 +43,7 @@ app.batches.markReady(batch.id);
 app.batches.start(batch.id, '2026-10-06T11:00:00.000Z');
 const run = app.results.registerRun({ tenantId, projectId, batchId: batch.id, externalRunId: 'RUN-001', rawFileHash: 'raw-hash-001', instrumentSoftwareVersion: 'instrument-7.2', startedAt: '2026-10-06T11:10:00.000Z' });
 app.results.completeRun(run.id, '2026-10-06T12:00:00.000Z', 'COMPLETED');
-const result = app.results.ingestRevision({ tenantId, projectId, batchId: batch.id, runId: run.id, ...(aliquots[0] ? { aliquotId: aliquots[0].id } : {}), analyte: 'lead', value: 0.12, unit: 'mg/L', detectionLimit: 0.01, qualityFlags: [], instrumentSoftwareVersion: 'instrument-7.2', contentHash: 'result-hash-001' });
+const result = app.results.ingestRevision({ tenantId, projectId, batchId: batch.id, runId: run.id, ...(aliquots[0] ? { aliquotId: aliquots[0].id } : {}), analyte: 'lead', value: 0.12, unit: 'mg/L', detectionLimit: 0.01, qualityFlags: [], instrumentSoftwareVersion: 'instrument-7.2', contentHash: 'result-hash-001', revisionNumber: 1, occurredAt: '2026-10-06T11:58:00.000Z' });
 app.quality.decide({ tenantId, projectId, batchId: batch.id, resultId: result.id, decision: 'APPROVED', reason: 'within protocol limits', ruleVersion: 'quality-v2', reviewerId: 'reviewer_01' });
 
 console.log(JSON.stringify({

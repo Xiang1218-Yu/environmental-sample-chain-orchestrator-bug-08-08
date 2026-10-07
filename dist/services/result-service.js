@@ -1,4 +1,5 @@
-import { assertCondition, assertFound } from '../domain/errors.js';
+import { assertCondition, assertFound, DomainError } from '../domain/errors.js';
+import { normalizeInstant } from '../domain/time.js';
 export class ResultService {
     store;
     constructor(store) {
@@ -13,7 +14,7 @@ export class ResultService {
         const batch = assertFound(this.store.batches.get(input.batchId), 'batch.not_found', 'batch not found');
         assertCondition(batch.tenantId === input.tenantId && batch.projectId === input.projectId, 'scope.forbidden', 'batch is outside the requested project');
         assertCondition(batch.status === 'RUNNING' || batch.status === 'RESULTS_PENDING', 'result.batch_not_running', 'batch is not accepting instrument runs');
-        const run = { id: this.store.nextId('run'), tenantId: input.tenantId, projectId: input.projectId, batchId: input.batchId, externalRunId: input.externalRunId, rawFileHash: input.rawFileHash, instrumentSoftwareVersion: input.instrumentSoftwareVersion, startedAt: input.startedAt, status: 'REGISTERED', version: 1 };
+        const run = { id: this.store.nextId('run'), tenantId: input.tenantId, projectId: input.projectId, batchId: input.batchId, externalRunId: input.externalRunId, rawFileHash: input.rawFileHash, instrumentSoftwareVersion: input.instrumentSoftwareVersion, startedAt: normalizeInstant(input.startedAt), status: 'REGISTERED', version: 1 };
         this.store.runs.set(run.id, run);
         batch.status = 'RESULTS_PENDING';
         batch.version += 1;
@@ -24,7 +25,7 @@ export class ResultService {
         const run = assertFound(this.store.runs.get(runId), 'result.run_not_found', 'instrument run not found');
         assertCondition(run.status === 'REGISTERED' || run.status === 'RUNNING', 'result.run_closed', 'instrument run is already closed');
         run.status = status;
-        run.completedAt = completedAt;
+        run.completedAt = normalizeInstant(completedAt);
         run.version += 1;
         return run;
     }
@@ -32,16 +33,33 @@ export class ResultService {
         const run = assertFound(this.store.runs.get(input.runId), 'result.run_not_found', 'instrument run not found');
         const batch = assertFound(this.store.batches.get(input.batchId), 'batch.not_found', 'batch not found');
         assertCondition(run.batchId === batch.id && run.projectId === input.projectId && batch.projectId === input.projectId, 'scope.forbidden', 'result does not belong to the requested batch');
-        const current = this.findCurrent(input);
-        if (current) {
-            if (current.contentHash === input.contentHash)
-                return current;
-            const next = this.findNextRevision(input, current);
-            return this.createRevision(input, next, current.id);
+        assertCondition(Number.isInteger(input.revisionNumber) && input.revisionNumber > 0, 'result.invalid_revision', 'revision number must be a positive integer');
+        const occurredAt = normalizeInstant(input.occurredAt);
+        const revisions = this.findRevisions(input);
+        const current = revisions.find((result) => result.status === 'CURRENT');
+        // Anchor for ordering decisions: the current revision when one exists,
+        // otherwise the highest known business revision (e.g. all withdrawn).
+        const anchor = current ?? [...revisions].sort((a, b) => b.revisionNumber - a.revisionNumber)[0];
+        if (anchor) {
+            if (input.revisionNumber < anchor.revisionNumber) {
+                // Late-arriving older revision. It must not displace the newer
+                // current one, no matter what its timestamps say.
+                this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'result.revision_stale', entity: 'result', entityId: anchor.id, metadata: { batchId: input.batchId, analyte: input.analyte, rejectedRevision: input.revisionNumber, currentRevision: anchor.revisionNumber } });
+                return anchor;
+            }
+            if (input.revisionNumber === anchor.revisionNumber) {
+                // Idempotent replay of the same business revision.
+                if (anchor.contentHash === input.contentHash)
+                    return anchor;
+                throw new DomainError('result.revision_conflict', 'same business revision was submitted with different content');
+            }
+            // Higher business revision wins, even when its occurrence time is
+            // earlier than the server receive time of the previous one.
+            return this.createRevision(input, occurredAt, anchor.status === 'CURRENT' ? anchor.id : undefined);
         }
-        return this.createRevision(input, 1);
+        return this.createRevision(input, occurredAt);
     }
-    createRevision(input, revisionNumber, supersedesRevisionId) {
+    createRevision(input, occurredAt, supersedesRevisionId) {
         const result = {
             id: this.store.nextId('result'),
             tenantId: input.tenantId,
@@ -57,9 +75,11 @@ export class ResultService {
             qualityFlags: [...input.qualityFlags],
             instrumentSoftwareVersion: input.instrumentSoftwareVersion,
             contentHash: input.contentHash,
-            revisionNumber,
+            revisionNumber: input.revisionNumber,
+            occurredAt,
             ...(supersedesRevisionId === undefined ? {} : { supersedesRevisionId }),
             status: 'CURRENT',
+            // Server receive time. Recorded for audit; never an ordering key.
             createdAt: this.store.now(),
             version: 1,
         };
@@ -69,14 +89,11 @@ export class ResultService {
             prior.version += 1;
         }
         this.store.results.set(result.id, result);
-        this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'result.revision_created', entity: 'result', entityId: result.id, metadata: { batchId: input.batchId, revisionNumber, analyte: input.analyte } });
-        this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'result.revision-created', aggregateId: result.id, payload: JSON.stringify({ resultId: result.id, batchId: input.batchId, revisionNumber }) });
+        this.store.addAudit({ tenantId: input.tenantId, projectId: input.projectId, action: 'result.revision_created', entity: 'result', entityId: result.id, metadata: { batchId: input.batchId, revisionNumber: input.revisionNumber, analyte: input.analyte } });
+        this.store.addOutbox({ tenantId: input.tenantId, projectId: input.projectId, topic: 'result.revision-created', aggregateId: result.id, payload: JSON.stringify({ resultId: result.id, batchId: input.batchId, revisionNumber: input.revisionNumber }) });
         return result;
     }
-    findCurrent(input) {
-        return [...this.store.results.values()].filter((result) => result.projectId === input.projectId && result.batchId === input.batchId && result.analyte === input.analyte && result.aliquotId === input.aliquotId && result.controlKind === input.controlKind && result.status === 'CURRENT').sort((a, b) => b.revisionNumber - a.revisionNumber)[0];
-    }
-    findNextRevision(input, current) {
-        return Math.max(current.revisionNumber + 1, ...[...this.store.results.values()].filter((result) => result.batchId === input.batchId && result.analyte === input.analyte && result.aliquotId === input.aliquotId && result.controlKind === input.controlKind).map((result) => result.revisionNumber + 1));
+    findRevisions(input) {
+        return [...this.store.results.values()].filter((result) => result.projectId === input.projectId && result.batchId === input.batchId && result.analyte === input.analyte && result.aliquotId === input.aliquotId && result.controlKind === input.controlKind);
     }
 }

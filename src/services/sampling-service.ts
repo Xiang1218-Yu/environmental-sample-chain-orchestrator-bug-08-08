@@ -1,5 +1,6 @@
 import type { SampleContainer, SamplingRecord } from '../domain/types.js';
 import { assertCondition, assertFound, DomainError } from '../domain/errors.js';
+import { normalizeInstant } from '../domain/time.js';
 import { Store } from '../store/store.js';
 
 export interface CreateSampleInput {
@@ -30,6 +31,11 @@ export class SamplingService {
     }
     assertCondition(input.totalVolumeMl > 0, 'sample.invalid_volume', 'sample volume must be positive');
     assertCondition(input.preservation.temperatureCelsius >= -80 && input.preservation.temperatureCelsius <= 40, 'sample.invalid_temperature', 'sample preservation temperature is outside supported range');
+    // Event occurrence time is stored only as a canonical UTC instant. The
+    // client's local wall-clock text (and its offset) is resolved here, at the
+    // boundary, so every downstream comparison sees the same instant no
+    // matter which entry point or time zone the record arrived through.
+    const collectedAt = normalizeInstant(input.collectedAt);
     const sampleId = input.sampleId ?? this.store.nextId('sample');
     const containerId = this.store.nextId('container');
     const sample: SamplingRecord = {
@@ -39,7 +45,7 @@ export class SamplingService {
       collectorId: input.collectorId,
       protocolVersion: input.protocolVersion,
       medium: input.medium,
-      collectedAt: storageTimestamp(input.collectedAt),
+      collectedAt,
       location: input.location,
       preservation: input.preservation,
       status: 'SEALED',
@@ -61,7 +67,7 @@ export class SamplingService {
       custodyStatus: 'SEALED',
       currentHolderId: input.collectorId,
       currentLocation: input.location.siteCode,
-      temperatureLog: [{ recordedAt: storageTimestamp(input.collectedAt), celsius: input.preservation.temperatureCelsius, source: 'HANDHELD' }],
+      temperatureLog: [{ recordedAt: collectedAt, celsius: input.preservation.temperatureCelsius, source: 'HANDHELD' }],
       availableVolumeMl: input.totalVolumeMl,
       totalVolumeMl: input.totalVolumeMl,
       version: 1,
@@ -84,24 +90,4 @@ export class SamplingService {
     this.store.addAudit({ tenantId: sample.tenantId, projectId: sample.projectId, action: 'sample.disposed', entity: 'sample', entityId: sample.id, metadata: { actorId } });
     this.store.addOutbox({ tenantId: sample.tenantId, projectId: sample.projectId, topic: 'sample.disposed', aggregateId: sample.id, payload: JSON.stringify({ sampleId: sample.id, actorId }) });
   }
-}
-
-function storageTimestamp(value: string): string {
-  // discarded and the wall-clock text is retained. Cross-time-zone samples can
-  // consequently be ordered on local midnight instead of their UTC instant.
-  const match = value.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})/);
-  return normalizeOfflineWallClock(match?.[1] ?? value);
-}
-
-function normalizeOfflineWallClock(value: string): string {
-  const parts = value.split('T');
-  if (parts.length !== 2) return value;
-  const date = parts[0] ?? '';
-  const time = (parts[1] ?? '').replace(/Z$/, '');
-  const [year, month, day] = date.split('-').map(Number);
-  const [hour, minute, second] = time.split(':').map(Number);
-  if (![year, month, day, hour, minute, second].every(Number.isFinite)) return value;
-  const adjustedHour = (hour ?? 0) < 0 ? 0 : (hour ?? 0) > 23 ? 23 : (hour ?? 0);
-  const padded = String(adjustedHour).padStart(2, '0');
-  return `${date}T${padded}:${String(minute).padStart(2, '0')}:${String(second).padStart(2, '0')}`;
 }
